@@ -142,7 +142,6 @@ pad_pluto.miss <- pad_pluto.miss %>%
   )
 
 # pad_pluto.df.hold <- pad_pluto.df
-
 pad_pluto.df <- bind_rows(
   pad_pluto.df %>%
     anti_join(pad_pluto.miss
@@ -154,15 +153,14 @@ pad_pluto.df <- bind_rows(
 # saveRDS(pad_pluto.df,"/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Data Sources/PAD/PAD_pluto_join 20180410_1355.rds")
 
 
-
-
 # Create NPV Key ----------------------------------------------------------
 
-npv.files <- list.files(path="/Users/billbachrach/Desktop/DOF PDFs/NPV_all")
-
+## list all notice of property value pdf names and retrieve file sizes
 setwd("/Users/billbachrach/Desktop/DOF PDFs/NPV_all")
+npv.files <- list.files(path="/Users/billbachrach/Desktop/DOF PDFs/NPV_all")
 npv.sizes <- file.size(npv.files)
 
+## generate dataframe with HWE standardized BBLs
 npv_tmp.key <- gsub("[^[:digit:]]","",
                     gsub("NPV.*","",npv.files)
 ) %>%
@@ -177,15 +175,20 @@ npv_tmp.key <- gsub("[^[:digit:]]","",
          )
   )
 
+## put document year into key
 npv_tmp.key[,"doc_year"] <- gsub("[^[:digit:]]",""
                                  ,gsub("_.*",""
                                        ,gsub(".*NPV","",npv.files)
                                  )
 )
 
+## put file sizes and file names into the key
 npv_tmp.key[,"file_size"] <- npv.sizes
 npv_tmp.key[,"filename"] <- npv.files
 
+## remove null files (size under 2500 bytes)
+## create a lagged year variable as PDFs describe building in the year prior
+## choose only years 2009 and up
 npv_tmp.key <- npv_tmp.key %>%
   filter(file_size > 2500) %>%
   mutate(Year = as.character(as.numeric(doc_year)-1)
@@ -199,11 +202,12 @@ npv_tmp.key <- npv_tmp.key %>%
 cl <- makeCluster(detectCores()/2)
 registerDoParallel(cl)
 
+## for each year join npv to the most proximate year in pluto/pad
+## because building state was documented at different times of year npv 2011 may be pluto year 2010
 year.vec <- 2009:2017
 
 tmp.list <- foreach(i = 1:length(year.vec)
                     , .packages = c("dplyr")) %dopar% {
-                      # for(i in 1:length(year.vec)){
                       year.curr <- year.vec[i]
                       npv.tmp <- npv_tmp.key %>% filter(Year==year.curr)
                       
@@ -224,6 +228,7 @@ stopCluster(cl)
 npv_join.key <- bind_rows(tmp.list)
 npv_join.key.hold <- npv_join.key
 
+## where there are still missing observations simply joining with the most recent year
 npv_join.miss <- npv_join.key %>%
   filter(is.na(BBL_bill))
 
@@ -255,24 +260,28 @@ gc()
 source("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Git/DOF_taxbills_scrape/NPV Scrape Individual Parameters/NPV Scrape Functions.R")
 setwd("/Users/billbachrach/Desktop/DOF PDFs/NPV_all")
 
+## to save memory only select necessary columns from npv
 npv.key_small <- npv_join.key %>%
   select(filename,doc_year,BldgClass,BBL,Id.pad)
 
+## break npv into manageable chunks to avoid running out of memory
 df.breaks <- c(seq(from=1,to=nrow(npv.key_small),by=50000),nrow(npv.key_small))
 BldgClass_outer.list <- list()
 
 start.time <- Sys.time()
 
-start <- 2
 ptm.outer <- proc.time()
+## note that the way the loop is designed the iterator should be one ahead, hence start position 2
+start <- 2
 for(i in start:length(df.breaks)){
   ptm <- proc.time()
   
+  ## taking chunk of npv
   tmp.df <- npv.key_small[df.breaks[i-1]:df.breaks[i],]
   len <- nrow(tmp.df)
   
+  ## limiting cores to avoid running out of memory
   cl <- makeCluster(round(detectCores()*.5),type="FORK")
-  
   
   BldgClass_outer.list[[i-1]] <- parLapply(cl,1:len, function(x){
     out <- list()
@@ -283,19 +292,19 @@ for(i in start:length(df.breaks)){
     out$filename <- tmp.df[x,"filename"]
     out$BldgClass <- tmp.df[x,"BldgClass"]
 
+    ## read in pdf
     tmp.text <- try(suppressWarnings(pdf_text(tmp.df[x,"filename"])),silent=T)
-    
-    # out$raw <- tmp.text
-    
+  
+    ## lots of error handling  
     if(class(tmp.text)=="try-error"){
       out$data <- rep(NA,7)
     }else{
+      ## get building classes and number of residential units
       bldg_class <- bldg_class.fun(tmp.text = tmp.text, doc_year = tmp.df[x,"doc_year"])
       res_units <- units.fun(tmp.text = tmp.text, doc_year = tmp.df[x,"doc_year"])
       
-      ## this is wrong, shoudl be ,tmp.df[x,"bbl]
-      ## sorted out in the next lapply but should be corrected
-      tmp.out <- cbind(bldg_class
+## matrix which can be turned into a dataframe
+            tmp.out <- cbind(bldg_class
                        ,res_units
                        ,tmp.df[x,"BBL"]
                        ,tmp.df[x,"Id.pad"]
@@ -319,6 +328,7 @@ BldgClass_full.time <- proc.time() - ptm.outer
 
 BldgClass_df.list <- list()
 
+## go through list, drop out items which are not matrices, turn into dataframe and create bbl
 start <- 1
 for(i in start:length(BldgClass_outer.list)){
   cat("starting iteration ",i,"\n")
@@ -345,7 +355,7 @@ for(i in start:length(BldgClass_outer.list)){
   cat("Finished iteration ",i,"\n")
 }
 
-
+## turn into dataframe
 BldgClass.df <- bind_rows(BldgClass_df.list) %>%
   mutate(BBL_Year = paste(BBL,(as.numeric(doc_year)-1),sep="_")) %>%
   filter(nchar(filename)==nchar("1013971550.NPV.2014_01_15.pdf") 
@@ -354,9 +364,8 @@ BldgClass.df <- bind_rows(BldgClass_df.list) %>%
 # saveRDS(BldgClass.df,"/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/BuildingClass_df 20180430_1541.rds")
 # BldgClass.df <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/BuildingClass_df 20180430_1541.rds")
 
-## Join with PAD/PLUTO
+## Join BldgClass dataframe with pad/pluto
 pad_pluto.df.hold <- pad_pluto.df
-
 pad_pluto.df <- pad_pluto.df.hold %>%
   mutate(BBL_Year = paste(BBL,Year.pad,sep="_")) %>%
   left_join(BldgClass.df %>%
@@ -366,13 +375,14 @@ pad_pluto.df <- pad_pluto.df.hold %>%
             ,by="BBL_Year"
             )
 
+## select only year 2017
 pp_2017.df <- pad_pluto.df %>%
   filter(Year.pad == 2017)
 
+## where building class is missing look for the most recent observation and add it in
 pp_miss.df <- pp_2017.df %>%
   filter(is.na(BldgClass_pdf))
 
-## where building class is missing look for the most recent observation and add it in
 out_df.list <- list()
 year.vec <- 2016:2014
 for(i in 1:length(year.vec)){
@@ -393,6 +403,7 @@ for(i in 1:length(year.vec)){
 pp_found.df <- bind_rows(out_df.list) %>%
   filter(!duplicated(BBL))
 
+## joining back in with pp_2017.df
 pp_2017.df <- pp_2017.df %>%
   left_join(pp_found.df %>%
               select(BBL,BldgClass_pdf,UnitsRes_Internal) %>%
@@ -416,7 +427,7 @@ pp_2017.df <- pp_2017.df %>%
 
 # Classifying -------------------------------------------------------------
 
-## identify the most prevalent building classes at condo level
+## for each BBL identify the internal building class with the most residential units
 pp_group.df <- pp_2017.df %>%
   filter(!is.na(BldgClass_pdf)) %>%
   group_by(BBL_bill,BldgClass_pdf) %>%
@@ -452,8 +463,8 @@ condocoop.df <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Sc
   )
 
 
+## join pluto with the dataframe containing primary, secondary and third building classes
 # condocoop.df.hold <- condocoop.df
-
 condocoop.df <- condocoop.df %>%
   left_join(pp_group.df %>%
               filter(order == 1) %>%
@@ -475,7 +486,7 @@ condocoop.df <- condocoop.df %>%
   )
 
 
-## Bldg Classes at the condo level 
+## Look at all building classes at condo level
 # tmp.classes <- c(
 #   condocoop.df %>% pull(BldgClass_Internal.1)
 #   ,condocoop.df %>% pull(BldgClass_Internal.2)
@@ -485,15 +496,15 @@ condocoop.df <- condocoop.df %>%
 # tmp.classes <- tmp.classes[!duplicated(tmp.classes)]
 # tmp.classes <- tmp.classes[order(tmp.classes)]
 
+## Define which condo level building classes belong with each ownership type
 small.classes <- c("A0","A1","A2","A3","A4","A5","A6","A7","A9","B1","B2","B3","B9","S1","S2")
 rental.classes <- c("C0","C1","C2","C3","C4","C5","C7","C9","D1","D2","D3","D5","D6","D7","D8","D9","RR","S4","S5","S9")
 condo.classes <- c("R0","R1","R2","R3","R4","R6","R8")
 coop.classes <- c("C6","C8","D0","D4","R9")
 other.classes <- c("CM","R5","R7","RB","RG","RH","RK","RP","RS","RT","RA","RW")
 
-
+## Assign type to Billing BBL based on BldgClass and primary internal building class
 condocoop.df <- condocoop.df %>%
-  # filter(UnitsRes>0) %>%
   mutate(Type = ifelse((BldgClass %in% condo.classes | BldgClass_Internal.1 %in% condo.classes)
                        ,"condo"
                        ,ifelse((BldgClass %in% coop.classes | BldgClass_Internal.1 %in% coop.classes)
@@ -532,7 +543,6 @@ tmp.sf <- st_as_sf(condocoop.df %>%
                      select(BBL,lon,lat)
                    ,coords = c("lon", "lat"), crs = 4326)
 
-## spatial join and then re-join with resi.out
 tmp.sf <- st_join(tmp.sf
                   ,pedia.map %>%
                     rename(Neighborhood = neighborhood) %>%
@@ -547,7 +557,7 @@ condocoop.df <- left_join(condocoop.df
 ) %>%
   select(-geometry)
 
-
+## Save to disk
 saveRDS(condocoop.df,"/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/condocoop_df 20180430_1615.rds")
 
 # condocoop.df %>%

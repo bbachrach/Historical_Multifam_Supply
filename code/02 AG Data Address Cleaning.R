@@ -1,4 +1,19 @@
 
+
+##############################################################################################################
+##
+## This script cleans condo/coop conversion data recieved from the NY Attorney General office
+## It proceeds in the following steps
+## 1. Initial readin and munging of data
+## 2. Cursory address cleaning based on observation of data
+## 3. Calling NYC GeoClient API to standardize addresses and get BBL
+## 4. Output unlinkable addresses for manual cleaning
+## 5. Call API with cleaned addresses
+## 6. Output final addresses that could not be linked to BBL
+## 7. Read in, combine and put into format that can be placed in pluto augmented
+##
+##############################################################################################################
+
 library(dplyr)
 library(lubridate)
 library(stringr)
@@ -10,6 +25,10 @@ library(RJSONIO)
 
 setwd("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Data Sources/AG Data")
 
+
+# Read in and initial munge -----------------------------------------------
+
+## keep raw format of ag data for reference and troubleshooting
 ag_raw.df <-   read.csv("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Data Sources/AG Data/Coop_Condo_AGdata.csv"
                         ,stringsAsFactors=F)
 
@@ -50,7 +69,6 @@ AGdata.df <- ungroup(
 
 
 ## load pluto 
-
 pluto <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Project Data/PLUTO/pluto_lean_compressed_2017.rds")
 pluto <- pluto %>% 
   select(BBL,Borough,Block,Lot,ZipCode,Address
@@ -87,7 +105,7 @@ pluto <- pluto %>%
     BldgClass_1 = str_sub(BldgClass,start=1,end=1)
   )
 
-
+## where zip code is an unusable format, set to NA
 AGdata.df <- AGdata.df %>%
   mutate(PLAN_ZIP = ifelse(!grepl("[[:digit:]]",PLAN_ZIP)
                            ,NA
@@ -95,15 +113,18 @@ AGdata.df <- AGdata.df %>%
   )
   )
 
+## only residential conversions
 AGdata.df <- AGdata.df %>%
   filter(
     PLAN_RESIDENTIAL %in% c("RESIDENTIAL","SPLIT/RESIDENTIAL")
          )
 
 
-## make address key 
+
+# Make Address Key --------------------------------------------------------
 ag_tmp <- AGdata.df
 
+## initial key with plan id, plan name and address
 address.key <- as.data.frame(
   cbind(
     ag_tmp[,"PLAN_ID_UNIQUE"]
@@ -114,7 +135,7 @@ address.key <- as.data.frame(
 ) %>%
   setNames(c("PLAN_ID_UNIQUE","PLAN_NAME","Original_Address"))
 
-## fix the Saints
+## fix "the Saints"
 tmp.key <- address.key %>%
   filter(
     (grepl("ST",Original_Address) & grepl("MARKS",Original_Address)) | 
@@ -134,6 +155,7 @@ tmp.key <- address.key %>%
     ,Corrected_Address = gsub("STPAUL","SAINT PAUL",Corrected_Address)
   )
 
+## prior munging didn't fix saints first, recombining in such a way that the previous munging can be re-used
 address.key <- left_join(
   address.key
   ,tmp.key %>%
@@ -192,9 +214,7 @@ address.key <- address.key %>%
     ,Corrected_Address = trimws(Corrected_Address)
   )
 
-
-
-
+## re-join with AGdata to get other fields of interest
 address.key <- left_join(address.key
                          ,ag_tmp %>% 
                            filter(!duplicated(PLAN_STREET)) %>% 
@@ -203,6 +223,7 @@ address.key <- left_join(address.key
                          ,by="Original_Address") %>% 
   filter(!duplicated(Corrected_Address))
 
+## put into a format which will be easily used with API
 address.key <- address.key %>%
   mutate(
     housenum = paste(gsub(" .*","",Corrected_Address),"   ")
@@ -217,8 +238,10 @@ address.key <- address.key %>%
   )
 
 
-## call to NYC Geoclient 
 
+# Call to NYC GeoClient API -----------------------------------------------
+
+## function to create urls
 url_create.fun <- function(baseurl = "https://api.cityofnewyork.us/geoclient/v1/address.json?"
                            ,keyid = "&app_id=43dc14b8&app_key=2df323d9189dfd5f1d2c8bf569843588"
                            ,housenum
@@ -270,7 +293,7 @@ url_create.fun <- function(baseurl = "https://api.cityofnewyork.us/geoclient/v1/
   return(url)
 }
 
-
+## create urls and add into address key
 tmp.vec <- unlist(
   lapply(1:nrow(address.key), function(x){
     url <- url_create.fun(
@@ -286,6 +309,7 @@ tmp.vec <- unlist(
 address.key[,"url"] <- tmp.vec
 
 
+## call API
 start <- 1
 end <- length(tmp.vec)
 
@@ -302,6 +326,7 @@ stopCluster(cl)
 api_call.time <- proc.time() - ptm
 
 
+## exctract content from JSON data, note copious error handling
 tmp_out.list <- list()
 for(i in 1:length(initial_output.list)){
   output <- initial_output.list[[i]]
@@ -347,9 +372,7 @@ tmp_out.list[which(unlist(
 
 tmp.out <- bind_rows(tmp_out.list)
 
-
-# Run through again -------------------------------------------------------
-
+## addresses which couldn't be coded by API
 notcoded.df <- bind_rows(
   address.key %>%
     anti_join(
@@ -362,6 +385,10 @@ notcoded.df <- bind_rows(
         filter(is.na(bbl))
     )
 )
+
+
+
+# Run through a second time to be sure ------------------------------------
 
 start <-1
 end <- nrow(notcoded.df)
@@ -487,10 +514,12 @@ write.csv(notcoded.df
 
 # Run through the names which were fixed manually -------------------------
 
+## read in the manually fixed addresses
 manual_coded.df <- read.csv("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/condo_coop_conversions manual_code 20180419_1604.csv"
                             ,stringsAsFactors=F
 )
 
+## create vector of urls for the manually coded addresses and add into dataframe
 tmp2.vec <- unlist(
   lapply(1:nrow(manual_coded.df), function(x){
     url <- url_create.fun(
@@ -505,6 +534,7 @@ tmp2.vec <- unlist(
 
 manual_coded.df[,"url"] <- tmp2.vec
 
+## call API
 start <-1
 end <- nrow(manual_coded.df)
 
@@ -521,6 +551,7 @@ stopCluster(cl)
 second_api_call.time <- proc.time() - ptm
 
 
+## retrive content
 tmp_out2.list <- list()
 
 for(i in 1:length(second_output.list)){
@@ -561,13 +592,14 @@ for(i in 1:length(second_output.list)){
   cat(i,"\n")
 }
 
-
+## remove nulls and put into dataframe
 tmp_out2.list[which(unlist(
   lapply(tmp_out2.list, function(x) class(x))
 ) != "data.frame")] <- NULL
 
 tmp.out2 <- bind_rows(tmp_out2.list)
 
+## create dataframe of addresses that could not be coded
 notcoded_secondary.df <- address.key %>%
   semi_join(tmp.out2 %>%
               filter(is.na(bbl)) %>%
@@ -586,23 +618,23 @@ notcoded_secondary.df <- address.key %>%
 #             ,by="url"
 #   )
 
-
+## write to disk to manually find BBLs
 write.csv(notcoded_secondary.df
           ,"/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/initial_secondary_notcoded_condo_coop_conversions.csv"
           ,row.names=F
           ,na=""
 )
 
-save.image(
-  paste(
-    "/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/AGdata_cleanse_workspace "
-    ,format(Sys.time()
-            ,"%Y%m%d_%H%S"
-    )
-    ,".RData"
-    ,sep=""
-  )
-)
+# save.image(
+#   paste(
+#     "/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/AGdata_cleanse_workspace "
+#     ,format(Sys.time()
+#             ,"%Y%m%d_%H%S"
+#     )
+#     ,".RData"
+#     ,sep=""
+#   )
+# )
 
 
 
@@ -612,6 +644,7 @@ mancoded_secondary.df <- read.csv("/Users/billbachrach/Dropbox (hodgeswardelliot
                                   ,stringsAsFactors=F)
 
 
+## join plan id with the initially coded addresses
 tmp.out <- tmp.out %>%
   left_join(
     address.key %>%
@@ -620,6 +653,7 @@ tmp.out <- tmp.out %>%
   ) %>%
   filter(!is.na(bbl))
 
+## join plan id with the secondary coded addresses
 tmp.out2 <- tmp.out2 %>%
   left_join(
     manual_coded.df %>%
@@ -628,6 +662,7 @@ tmp.out2 <- tmp.out2 %>%
   ) %>%
   filter(!is.na(bbl))
 
+## for the secondary coded addresses there are duplicates, selecting the most prevalent BBL within each plan id
 tmp.out2 <- tmp.out2 %>%
   group_by(PLAN_ID_UNIQUE) %>%
   group_by(bbl) %>%
@@ -636,9 +671,11 @@ tmp.out2 <- tmp.out2 %>%
   ungroup() %>%
   filter(!duplicated(bbl))
 
+## bind the primary and secondary API dataframes
 tmp.out <- bind_rows(tmp.out
                      ,tmp.out2)
 
+## Create HWE standardized BBL
 tmp.out <- tmp.out %>%
   filter(!is.na(bbl) & !duplicated(bbl)) %>%
   mutate(BBL = 
@@ -655,6 +692,7 @@ tmp.out <- tmp.out %>%
            )
   )
 
+## where manually coded BBLs and API coded BBLs exist, the manually coded BBLs take precedence
 tmp.out <- tmp.out %>%
   left_join(mancoded_secondary.df %>%
               select(PLAN_ID_UNIQUE,BBL) %>%
@@ -667,6 +705,7 @@ tmp.out <- tmp.out %>%
                       )
          )
 
+## append the API coded BBLs with the manually coded BBLs
 tmp.out <- bind_rows(
   tmp.out
   ,mancoded_secondary.df %>%
@@ -674,12 +713,19 @@ tmp.out <- bind_rows(
               ,by="PLAN_ID_UNIQUE")
 )
 
+
+
+# Join with AG data and mutate --------------------------------------------
+
+
+## join AG data with the coded addresses/BBLs
 AGdata.df <- tmp.out %>%
   select(BBL,PLAN_ID_UNIQUE,latitude,longitude,buildingIdentificationNumber) %>%
   rename(BIN = buildingIdentificationNumber) %>%
   left_join(AGdata.df
             ,by="PLAN_ID_UNIQUE")
-  
+
+## create a variable that is year in which the conversion took place  
 AGdata.df <- AGdata.df %>%
   mutate(EFFECTIVE_YEAR = ifelse(!is.na(PLAN_DATE_EFFECTIVE)
                                  ,year(PLAN_DATE_EFFECTIVE)
@@ -687,7 +733,7 @@ AGdata.df <- AGdata.df %>%
   )
   )
 
-
+## put into format easily combined with pluto augmented
 out.df <- AGdata.df %>%
   select(BBL,EFFECTIVE_YEAR,PLAN_TYPE,UNITS) %>%
   rename(ConversionYear = EFFECTIVE_YEAR
@@ -700,5 +746,6 @@ out.df <- AGdata.df %>%
   )
   )
 
+## save to disk
 saveRDS(out.df,"/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/condo_coop_conversions_df 20180427_1306.rds")
-AGdata.df.hold <- AGdata.df
+# AGdata.df.hold <- AGdata.df
