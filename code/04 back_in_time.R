@@ -6,10 +6,14 @@
 ##
 ##############################################################################################################
 
+library(dplyr)
+
+options(scipen=999)
+
 # Dataframe containing the proportion of condo/coops being rented  --------
 
 # pluto.aug <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/pluto_augmented 20180501_1332.rds")
-pluto.aug <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/pluto_augmented 20180619_1634.rds")
+pluto.aug <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/pluto_augmented 20180622_1527.rds")
 
 
 ## read in initial
@@ -264,9 +268,6 @@ out.df.boro <- out.df
 
 # NYC ---------------------------------------------------------------------
 
-# z <- Neighborhood.levs.conversion[1]
-# x <- 1
-
 tmp.df.outer <- pluto.aug
 
 tmp.out <- lapply(1:length(year.levs), function(x){
@@ -369,7 +370,7 @@ out.df <- bind_rows(out.df.nyc,out.df.boro,out.df.nbrhd) %>%
 
 
 getwd()
-setwd("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data")
+setwd("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/output")
 write.csv(out.df,
           paste("multifam_supply"
                 ,format(
@@ -390,11 +391,12 @@ saveRDS(out.df,paste("multifam_supply"
                      ,sep="")
 )
 
+setwd("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data")
 saveRDS(pluto.aug
         ,paste("pluto_augmented"
                ,format(
                  Sys.time()
-                 ,"%Y%m%d_%H%M%S"
+                 ,"%Y%m%d_%H%M"
                )
                ,".rds"
                ,sep="")

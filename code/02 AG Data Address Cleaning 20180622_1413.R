@@ -638,17 +638,38 @@ geocoded.df <- bind_rows(
   ,mancoded_bbl.df
 )
 
-AGdata.df <- bind_rows(
-  AGdata.df
-  ,AGdata_mancoded.df
-)
+# AGdata.df <- bind_rows(
+#   AGdata.df
+#   ,AGdata_mancoded.df
+# )
 
 geocoded.df <- geocoded.df %>%
   select(PLAN_ID_UNIQUE,BBL,lat,lon) %>%
   full_join(
     AGdata.df
     ,by="PLAN_ID_UNIQUE"
-  )
+  ) %>%
+  filter(!duplicated(paste(BBL,PLAN_ID_UNIQUE,PLAN_CONSTR_TYPE)))
+
+
+## filter out duplicated BBLs
+geocoded_new_or_noneffective <- geocoded.df %>%
+  filter(is.na(PLAN_DATE_EFFECTIVE) | PLAN_CONSTR_TYPE %in% "NEW")
+
+geocoded.df <- geocoded.df %>%
+  filter(!(is.na(PLAN_DATE_EFFECTIVE) | PLAN_CONSTR_TYPE %in% "NEW")) %>%
+  group_by(BBL) %>%
+  filter(PLAN_DATE_EFFECTIVE == min(PLAN_DATE_EFFECTIVE))
+
+
+geocoded.df <- bind_rows(
+  geocoded.df
+  ,geocoded_new_or_noneffective %>%
+    anti_join(geocoded.df
+              ,by="BBL") %>%
+    arrange(PLAN_DATE_REVIEWED)
+  ) %>%
+  filter(!duplicated(BBL))
 
 ## create a variable that is year in which the conversion took place  
 geocoded.df <- geocoded.df %>%
@@ -657,7 +678,6 @@ geocoded.df <- geocoded.df %>%
                                  ,year(PLAN_DATE_REVIEWED) + 1
   )
   )
-
 
 ## put into format easily combined with pluto augmented
 geocoded.df <- geocoded.df %>%
@@ -671,6 +691,8 @@ geocoded.df <- geocoded.df %>%
     ,ConversionType
   )
   )
+  
+
 
 ## save to disk
 saveRDS(geocoded.df
@@ -683,6 +705,4 @@ saveRDS(geocoded.df
           ,".csv"
           ,sep=""
         )
-        ,row.names=F
-        ,na=""
 )

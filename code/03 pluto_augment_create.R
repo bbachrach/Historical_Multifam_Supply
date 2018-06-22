@@ -11,6 +11,8 @@ library(xlsx)
 library(tidyverse)
 library(stringr)
 library(httr)
+library(sf)
+library(geojsonio)
 
 
 source("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach//useful functions/HWE_FUNCTIONS.r")
@@ -27,11 +29,15 @@ options(scipen=999)
 condocoop.df <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/condocoop_df 20180430_1615.rds") %>%
   filter(!duplicated(BBL) & !grepl("[[:alpha:]]",BBL))
 
-pluto.all <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Project Data/PLUTO/pluto_lean_compressed_2003_2017.rds")
+pluto.all <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Project Data/PLUTO/pluto_lean_compressed_all_years.rds")
 
 ## get pluto 2017 version and put BBL, APPBBL, APPDate into proper format
+
+## start by getting both 2017 and 2018 data
 pluto <- pluto.all %>%
-  filter(Year==2017 & !duplicated(BBL)) %>%
+  filter(Year==2018) %>%
+  # filter(Year>=2017) %>%
+  # filter(Year==2017 & !duplicated(BBL)) %>%
   mutate(BBL = as.character(
     paste(as.numeric(BoroCode)
           ,as.numeric(Block)
@@ -56,53 +62,91 @@ pluto <- pluto.all %>%
   ,randomId = sample(1:n(),n(),replace=F)
   )
 
+## restrict to 2017 but pull BldgClass from 2018
+# pluto <- pluto %>%
+#   filter(Year == 2017 & !duplicated(BBL)) %>%
+#   left_join(
+#     pluto %>% 
+#       filter(Year == 2018) %>%
+#       select(BBL,BldgClass,Building_Type) %>%
+#       rename(BldgClass.tmp = BldgClass
+#              ,Building_Type.tmp = Building_Type)
+#     ,by="BBL"
+#   ) %>%
+#   mutate(
+#     BldgClass = ifelse(!is.na(BldgClass.tmp) & grepl("[[:alnum:]]",BldgClass.tmp)
+#                        ,BldgClass.tmp
+#                        ,BldgClass
+#     )
+#     ,Building_Type = ifelse(!is.na(Building_Type) & grepl("[[:alnum:]]",Building_Type.tmp)
+#                             ,Building_Type.tmp
+#                             ,Building_Type
+#     )
+#   ) %>%
+#   select(-BldgClass.tmp,-Building_Type.tmp)
 
 
 # Recover missing year where possible -------------------------------------
 
 ## restrict pluto to years 2014+, no duplicates with preference for most recent version and no improperly formatted years
-pluto.tmp <- pluto.all %>%
-  filter(Year >= 2014 & YearBuilt!=0 & nchar(YearBuilt)==4) %>%
-  arrange(desc(Year)) %>%
-  filter(!duplicated(BBL)) %>%
-  mutate(BBL = as.character(
-    paste(as.numeric(BoroCode)
-          ,as.numeric(Block)
-          ,as.numeric(Lot)
-          ,sep="_"
+incorrect_yb <- pluto %>%
+  summarize(incorrect_yb.count = sum(YearBuilt==0 | nchar(as.character(YearBuilt))!=4)) %>%
+  # summarize(incorrect_yb.count = sum(YearBuilt==0)) %>%
+  pull(incorrect_yb.count)
+
+
+
+if(incorrect_yb > 0){
+  pluto.tmp <- pluto.all %>%
+    filter(Year >= 2014 & YearBuilt!=0 & nchar(as.character(YearBuilt))==4) %>%
+    arrange(desc(Year)) %>%
+    filter(!duplicated(BBL)) %>%
+    mutate(BBL = as.character(
+      paste(as.numeric(BoroCode)
+            ,as.numeric(Block)
+            ,as.numeric(Lot)
+            ,sep="_"
+      )
     )
-  )
-  )
-
-## restrict to only BBLs which have an improperly formatted year in Pluto v2017
-pluto.tmp <- pluto.tmp %>%
-  semi_join(
-    pluto %>%
-      filter(YearBuilt==0 | nchar(YearBuilt)<4) 
-    ,by=c("BBL","BldgClass","UnitsRes")
-  ) %>%
-  arrange(BoroCode,desc(UnitsRes)) %>%
-  select(BBL,BldgClass,UnitsRes,YearBuilt,everything())
-
-## where possible substitute the year for prior versions of pluto into the 2017 version
-pluto <- pluto %>%
-  left_join(
-    pluto.tmp %>%
-      select(BBL,BldgClass,UnitsRes,YearBuilt) %>%
-      rename(tmp = YearBuilt)
-    ## note joining by multiple columns to ensure the building didn't change
-    ,by=c("BBL","BldgClass","UnitsRes")
-  ) %>%
-  mutate(YearBuilt = ifelse(!is.na(tmp)
-                            ,tmp
-                            ,YearBuilt
-                            )
-         )
-
+    )
+  
+  ## restrict to only BBLs which have an improperly formatted year in Pluto v2017
+  pluto.tmp <- pluto.tmp %>%
+    semi_join(
+      pluto %>%
+        filter(YearBuilt==0 | nchar(as.character(YearBuilt))<4) 
+      ,by=c("BBL"
+            # ,"BldgClass"
+            ,"UnitsRes"
+            )
+    ) %>%
+    arrange(BoroCode,desc(UnitsRes)) %>%
+    select(BBL,BldgClass,UnitsRes,YearBuilt,everything())
+  
+  ## where possible substitute the year for prior versions of pluto into the 2017 version
+  pluto <- pluto %>%
+    # select(-tmp) %>%
+    left_join(
+      pluto.tmp %>%
+        select(BBL,UnitsRes,YearBuilt) %>%
+        rename(tmp = YearBuilt)
+      ## note joining by multiple columns to ensure the building didn't change
+      ,by=c("BBL","UnitsRes")
+    ) %>%
+    mutate(YearBuilt = ifelse(!is.na(tmp)
+                              ,tmp
+                              ,YearBuilt
+    )
+    ) %>%
+    select(-tmp)
+}
 
 # Recover lat/lon where missing -------------------------------------------
 
 ## recency of year is not as necessary here, general geographic location shouldn't change
+pluto.hold <- pluto
+pluto <- pluto.hold
+
 pluto <- pluto %>%
   left_join(
     pluto.all %>%
@@ -130,7 +174,8 @@ pluto <- pluto %>%
                        ,lon.tmp
                        ,lon
                        )
-         )
+         ) %>%
+  select(-lat.tmp,-lon.tmp)
 
 
 
@@ -241,6 +286,8 @@ tco.df.hold <- read_csv(tco_nyc_httr.dl$content
   select(-BIN)
 
 
+## Attempting to join TCO with PLUTO in multiple ways
+
 ## join with pluto by BBL
 tco.df <- tco.df.hold %>%
   filter(JOB_TYPE == "NB") %>%
@@ -255,7 +302,7 @@ pluto.aug <- pluto.aug %>%
             ,by="BBL"
   )
 
-## join with pluto by APPBBL
+## join with pluto by APPBBL (prior BBL)
 pluto_tmp.aug <- pluto.aug %>%
   filter(is.na(C_O_ISSUE_DATE)) %>%
   select(-C_O_ISSUE_DATE) %>%
@@ -295,6 +342,10 @@ pluto.aug <- bind_rows(
     )
   ,pluto_tmp.aug
 ) 
+
+# pluto.aug.hold <- pluto.aug
+pluto.aug <- pluto.aug %>%
+  filter(year(C_O_ISSUE_DATE)<2018 | is.na(C_O_ISSUE_DATE))
 
 ## Use actual TCO where appropriate, imputed TCO where actual TCO is not available
 pluto.aug <- pluto.aug %>%
@@ -363,7 +414,9 @@ pluto.aug <- left_join(pluto.aug
 
 # AG Data -----------------------------------------------------------------
 
-AGdata.df <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/condo_coop_conversions_df 20180427_1306.rds")
+AGdata.df <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/condo_coop_conversions_df 20180622_1518.rds")
+# AGdata_old.df <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/condo_coop_conversions_df 20180427_1306.rds")
+
 
 ## If conversion year is missing try to use APPDate (only for condos)
 ## only use APPDate if
@@ -405,7 +458,17 @@ pluto.aug <- pluto.aug.hold %>%
   )
 
 ## save to disk
-saveRDS(pluto.aug,"/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/pluto_augmented 20180501_1332.rds")
+saveRDS(pluto.aug
+        ,paste(
+          "/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/pluto_augmented "
+          ,format(
+            Sys.time()
+            ,"%Y%m%d_%H%M"
+          )
+          ,".rds"
+          ,sep=""
+        )
+)
 
 
 # Conversion data frames (depricated) -------------------------------------
