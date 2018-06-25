@@ -660,7 +660,7 @@ saveRDS(geocoded.df
             Sys.time()
             ,"%Y%m%d_%H%M"
           )
-          ,".csv"
+          ,".rds"
           ,sep=""
         )
 )
