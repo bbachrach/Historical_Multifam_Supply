@@ -7,14 +7,15 @@
 ##############################################################################################################
 
 library(dplyr)
+library(lubridate)
+library(parallel)
 
 options(scipen=999)
 
-# Dataframe containing the proportion of condo/coops being rented  --------
-
-# pluto.aug <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/pluto_augmented 20180501_1332.rds")
+## Pluto augmented
 pluto.aug <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/pluto_augmented 20180622_1527.rds")
 
+# Dataframe containing the proportion of condo/coops being rented  --------
 
 ## read in initial
 condo_rental.df <- read.csv("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Data Sources/HVS/condo rental metric small.csv"
@@ -66,6 +67,7 @@ Neighborhood.levs.conversion <- pluto.aug %>%
   arrange(AREA) %>%
   pull(AREA)
 
+## vector of years of interest
 year.levs <- (year(Sys.Date())-1):1980
 
 # Step backward through time ----------------------------------------------
@@ -141,8 +143,6 @@ tmp.derp <- parLapply(cl,Neighborhood.levs.conversion, function(z){
 
 stopCluster(cl)
 
-# saveRDS(tmp.derp,"tmp_nbrhd_stats.rds")
-
 ## bind list
 out.df <- as.data.frame(do.call("rbind",tmp.derp)
                         ,stringsAsFactors=F)
@@ -166,7 +166,6 @@ out.df <- left_join(out.df
 
 out.df.nbrhd <- out.df
 
-# View(out.df.nbrhd)
 
 # Borough -----------------------------------------------------------------
 
@@ -367,10 +366,9 @@ out.df <- bind_rows(out.df.nyc,out.df.boro,out.df.nbrhd) %>%
 
 # Save to disk ------------------------------------------------------------
 
-
-
 getwd()
 setwd("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/output")
+
 write.csv(out.df,
           paste("multifam_supply"
                 ,format(
