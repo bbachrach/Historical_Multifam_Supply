@@ -7,10 +7,8 @@
 ## 1. Initial readin and munging of data
 ## 2. Cursory address cleaning based on observation of data
 ## 3. Calling NYC GeoClient API to standardize addresses and get BBL
-## 4. Output unlinkable addresses for manual cleaning
-## 5. Call API with cleaned addresses
-## 6. Output final addresses that could not be linked to BBL
-## 7. Read in, combine and put into format that can be placed in pluto augmented
+## 4. Output final addresses that could not be linked to BBL
+## 5. Read in, combine and put into format that can be placed in pluto augmented
 ##
 ##############################################################################################################
 
@@ -22,6 +20,8 @@ library(doParallel)
 library(httr)
 library(RCurl)
 library(RJSONIO)
+
+options(scipen=999)
 
 setwd("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Data Sources/AG Data")
 
@@ -132,7 +132,6 @@ old_method_geocoded <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/
                                  ,paste(plan_id,"_0",sep="")
   )
   )
-
 
 AGdata_mancoded.df <- AGdata.df %>%
   semi_join(
@@ -411,7 +410,7 @@ nyc_geoclient_call.fun <- function(df,max_sleep.time=.001){
       )
       
     } else {
-      out <- list(url = tmp.vec[i])
+      out <- list(url = df[i,"url"])
     }
     out <- t(unlist(out)) %>% as.data.frame()
     tmp_out.list[[i]] <- out
@@ -597,10 +596,10 @@ geocoded.df <- bind_rows(
   ,mancoded_bbl.df
 )
 
-# AGdata.df <- bind_rows(
-#   AGdata.df
-#   ,AGdata_mancoded.df
-# )
+AGdata.df <- bind_rows(
+  AGdata.df
+  ,AGdata_mancoded.df
+)
 
 geocoded.df <- geocoded.df %>%
   select(PLAN_ID_UNIQUE,BBL,lat,lon) %>%

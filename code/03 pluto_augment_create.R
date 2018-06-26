@@ -31,13 +31,11 @@ condocoop.df <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Sc
 
 pluto.all <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Project Data/PLUTO/pluto_lean_compressed_all_years.rds")
 
-## get pluto 2017 version and put BBL, APPBBL, APPDate into proper format
+## get most recent version of pluto and put BBL, APPBBL, APPDate into proper format
 
-## start by getting both 2017 and 2018 data
+## start by getting most recent data
 pluto <- pluto.all %>%
   filter(Year==2018) %>%
-  # filter(Year>=2017) %>%
-  # filter(Year==2017 & !duplicated(BBL)) %>%
   mutate(BBL = as.character(
     paste(as.numeric(BoroCode)
           ,as.numeric(Block)
@@ -62,38 +60,12 @@ pluto <- pluto.all %>%
   ,randomId = sample(1:n(),n(),replace=F)
   )
 
-## restrict to 2017 but pull BldgClass from 2018
-# pluto <- pluto %>%
-#   filter(Year == 2017 & !duplicated(BBL)) %>%
-#   left_join(
-#     pluto %>% 
-#       filter(Year == 2018) %>%
-#       select(BBL,BldgClass,Building_Type) %>%
-#       rename(BldgClass.tmp = BldgClass
-#              ,Building_Type.tmp = Building_Type)
-#     ,by="BBL"
-#   ) %>%
-#   mutate(
-#     BldgClass = ifelse(!is.na(BldgClass.tmp) & grepl("[[:alnum:]]",BldgClass.tmp)
-#                        ,BldgClass.tmp
-#                        ,BldgClass
-#     )
-#     ,Building_Type = ifelse(!is.na(Building_Type) & grepl("[[:alnum:]]",Building_Type.tmp)
-#                             ,Building_Type.tmp
-#                             ,Building_Type
-#     )
-#   ) %>%
-#   select(-BldgClass.tmp,-Building_Type.tmp)
-
-
 # Recover missing year where possible -------------------------------------
 
 ## restrict pluto to years 2014+, no duplicates with preference for most recent version and no improperly formatted years
 incorrect_yb <- pluto %>%
   summarize(incorrect_yb.count = sum(YearBuilt==0 | nchar(as.character(YearBuilt))!=4)) %>%
-  # summarize(incorrect_yb.count = sum(YearBuilt==0)) %>%
   pull(incorrect_yb.count)
-
 
 
 if(incorrect_yb > 0){

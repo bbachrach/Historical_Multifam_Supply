@@ -16,13 +16,13 @@ This collection of scripts generates historical multifamily stock from 1980-curr
     + [Classifying]
     + [Attach Neighborhood]
 * [AG Data Address Cleaning]
-    + This script takes the data given to us by the attorney general's office and links it to BBL. It then creates a dataframe with conversion date for billing level BBLs which can be linked to pluto. It operates primarily by calling the NYC GeoClient API. It should be noted that this process is heavily reliant on someone manually correcting some addresses and eventually finding the BBL of a small number of addresses which cannot be processed programatically. 
+    + This script takes the data given to us by the attorney general's office and links it to BBL. It then creates a dataframe with conversion date for billing level BBLs which can be linked to pluto. It operates primarily by calling the NYC GeoClient API.
     + [Read in and Munge AG data and PLUTO]
     + [make address key]
     + [call to NYC Geoclient]
-    + [Find missing observations and run through a second time]
-    + [Run through the names which were fixed manually]
-    + [Read in Final Manual step and create output]
+    + [Function to Call API]
+    + [First API call]
+    + [Final join and munge]
 * [Pluto Augment Create]
     + This script takes the condo coop classifications and cleansed AG data to create a pluto dataframe that includes fields for whether a building is condo/coop and (if applicable) the date it was converted. It further creates dataframes which indicate how many units were converted by year and geographic area
     + [Readin Munge Join]
@@ -186,6 +186,8 @@ pad_pluto.df <- bind_rows(
 ## Create NOPV Key
 
 List all Notice of Property Value PDF names. Using these names create a dataframe that includes pertinent information (BBL, Year, file size). Remove any filenames with sizes under 2500 bytes. Anything below this size appears to be null. 
+
+NOTE: Notice of Property Value documents have to be stored locally or on S3. If stored in dropbox it creates the possibility that if others in the company accidentally set the data science folder to local sync that it will crash their machines due to the indexing.
 
 ```{r eval=F}
 npv.files <- list.files(path="/Users/billbachrach/Desktop/DOF PDFs/NPV_all")
@@ -592,7 +594,7 @@ condocoop.df <- condocoop.df %>%
 ```
 
 
-# Attach Neighborhood
+## Attach Neighborhood
 
 Use customary method with pediacities shapefile
 ```{r eval=F}
@@ -634,21 +636,50 @@ saveRDS(condocoop.df,"/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Scien
 
 # AG Data Address Cleaning
 
+his script takes the data given to us by the attorney general's office and links it to BBL. It then creates a dataframe with conversion date for billing level BBLs which can be linked to pluto. It operates primarily by calling the NYC GeoClient API. It should be noted that this process is heavily reliant on someone manually correcting some addresses and eventually finding the BBL of a small number of addresses which cannot be processed programatically. However, because any future updates will only include a handful of observations which have been converted within the past year this step shouldn't take much for updates. It is also likely that more recent observations have addresses which are properly formatted (assuming that the conversion application is done online and not via paper forms).
+
+
 ## Read in and Munge AG data and PLUTO 
 
-Read in version of ag data to keep raw for troubleshooting
+
 ```{r eval=F}
-saveRDS(condocoop.df,"/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/condocoop_df 20180430_1615.rds")
+library(dplyr)
+library(lubridate)
+library(stringr)
+library(parallel)
+library(doParallel)
+library(httr)
+library(RCurl)
+library(RJSONIO)
+
+options(scipen=999)
+
+setwd("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Data Sources/AG Data")
 ```
 
-
+Read in all existing versions of our raw AG data, bind and de-duplicate
 ```{r eval=F}
-AGdata.df <- ungroup(
+ag_raw.df <-   bind_rows(
   read.csv("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Data Sources/AG Data/Coop_Condo_AGdata.csv"
-           ,stringsAsFactors=F) %>% 
+                        ,stringsAsFactors=F)
+  ,read.csv("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Data Sources/AG Data/data/Coop_Condo_AGdata 20180523.csv"
+            ,stringsAsFactors=F)
+  ,read.csv("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Data Sources/AG Data/data/Coop_Condo_AGdata 20180619.csv"
+            ,stringsAsFactors=F)
+)
+
+ag_raw.df <- ag_raw.df %>%
+  arrange(PLAN_DATE_SUBMITTED) %>%
+  filter(!duplicated(gsub("[^[:alnum:]]","",PLAN_ID)))
+```
+
+Initial munge of AG data
+```{r eval=F}
+AGdata.df <- ag_raw.df %>%
     select(PLAN_ID,everything()) %>%
     mutate(
-      UNITS = ifelse((is.na(PLAN_UNITS) | PLAN_UNITS==0)
+      ## if PLAN_UNITS is NA or 0 or missing, take PLAN_TOT_UNITS instead
+      UNITS = ifelse((is.na(PLAN_UNITS) | PLAN_UNITS==0 | !grepl("[[:digit:]]",PLAN_UNITS))
                      ,PLAN_TOT_UNITS
                      ,PLAN_UNITS
       )
@@ -660,6 +691,7 @@ AGdata.df <- ungroup(
       ,AMND_DATE_REVIEWED = parse_date_time(AMND_DATE_REVIEWED,"d!-b!-y!*")
       ,PLAN_ID = trimws(PLAN_ID)
       ,PLAN_ID_NUMER = gsub("[^[:digit:]]","",PLAN_ID)
+      ## Create Borough from the county variable
       ,PLAN_BORO = ifelse(PLAN_BORO_COUNTY %in% "NEW YORK"
                           ,"MANHATTAN"
                           ,ifelse(PLAN_BORO_COUNTY %in% "KINGS"
@@ -673,73 +705,97 @@ AGdata.df <- ungroup(
       ,PLAN_ZIP_OLD = PLAN_ZIP
     ) %>% 
     group_by(PLAN_ID) %>% 
+  ## Create the PLAN_ID_UNIQUE variable which is pointless but a legacy ID
     mutate(
       PLAN_ID_UNIQUE = paste(PLAN_ID,0:(n()-1),sep="_")
-    )
-)
+    ) %>%
+  ungroup()
 ```
 
 
+Keep only Residential conversions. If there are duplicated of address (PLAN_STREET), keep only the earliest instance, if ZIP is not formatted properly set to NA
 ```{r eval=F}
-pluto <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Project Data/PLUTO/pluto_lean_compressed_2017.rds")
-pluto <- pluto %>% 
-  select(BBL,Borough,Block,Lot,ZipCode,Address
-                          ,BldgClass,Easements,OwnerType,OwnerName
-                          ,BldgArea,ComArea,ResArea,OfficeArea,RetailArea,GarageArea,StrgeArea,FactryArea,OtherArea
-                          ,NumBldgs,NumFloors,UnitsRes,UnitsTotal,YearBuilt,
-                          CondoNo,XCoord,YCoord,lat,lon) %>% 
-  mutate(
-    borocode = ifelse(Borough=="MN"
-                      ,1
-                      ,ifelse(Borough=="BX"
-                              ,2
-                              ,ifelse(Borough=="BK"
-                                      ,3
-                                      ,ifelse(Borough=="QN"
-                                              ,4
-                                              ,ifelse(
-                                                Borough=="SI"
-                                                ,5
-                                                ,str_sub(BBL,start=1,end=1)
-                                              )
-                                      )
-                              )
-                      )
-    )
-    ,BBL= paste(
-      borocode
-      ,Block
-      ,Lot
-      ,sep="_"),
-    CondoNo= ifelse(CondoNo==0,
-                    0,
-                    paste(str_sub(BBL,start=1,end=1),CondoNo,sep="_")),
-    BldgClass_1 = str_sub(BldgClass,start=1,end=1)
-  )
+## only residential conversions
+AGdata.df <- AGdata.df %>%
+  filter(grepl("RESIDENTIAL",PLAN_RESIDENTIAL))
 
+AGdata.df <- AGdata.df %>%
+  group_by(PLAN_STREET) %>%
+  arrange(PLAN_DATE_SUBMITTED,PLAN_DATE_EFFECTIVE)  %>%
+  ungroup() %>%
+  filter(!duplicated(PLAN_STREET))
 
-pluto_boro.levs <- as.character(as.data.frame(
-  pluto %>%
-    filter(!duplicated(Borough)) %>% 
-    arrange(substr(BBL,start=1,stop=1))
-  ,stringsAsFactors=F
-)[,"Borough"])
-```
-
-Set ZipCode to NA where it doesn't contain a digit, select only residential conversions
-
-```{r eval=F}
+## where zip code is an unusable format, set to NA
 AGdata.df <- AGdata.df %>%
   mutate(PLAN_ZIP = ifelse(!grepl("[[:digit:]]",PLAN_ZIP)
                            ,NA
                            ,PLAN_ZIP
   )
   )
+```
+
+
+Read in all existing manually coded csv files. These files are instances where we had a human fix the addresses. First read in those where the address was fixed. These are called "initial" because there were two steps in the manual coding process. The first fixed the address field for a few hundred observations and was called "initial". Then the fixed addresses were fed to the Geoclient API. Those that still could not be geocoded then had BBL attached manually using the Zola or DOF Tax Map GUI.
+```{r eval=F}
+mancoded_initial.df <- bind_rows(
+  read.csv("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/condo_coop_conversions manual_code 20180419_1604.csv"
+           ,stringsAsFactors=F)
+  ,read.csv("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/condo_coop_conversions manual_code 20180419.csv"
+            ,stringsAsFactors=F)
+)
+
+mancoded_initial.df <- mancoded_initial.df %>%
+  filter(!duplicated(paste(PLAN_ID_UNIQUE,HOUSE_NUMBER,STREET_NAME)))
+```
+
+Now read in the secondary manually coded CSVs and de-duplicate.
+```{r eval=F}
+mancoded_bbl.df <- bind_rows(
+  read.csv("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/secondary_notcoded_condo_coop_conversions manual_code 20180419_1641.csv"
+           ,stringsAsFactors=F)
+  ,read.csv("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/secondary_notcoded_condo_coop_conversions manual_code 20180420_1134.csv"
+            ,stringsAsFactors=F)
+  ,read.csv("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/mancoded_condo_coop_20180618.csv"
+            ,stringsAsFactors=F)
+  ,read.csv("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/mancoded_condo_coop_20180619.csv"
+            ,stringsAsFactors=F)
+  ,read.csv("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/mancoded_condo_coop_20180621.csv"
+            ,stringsAsFactors=F
+  ) %>%
+    select(PLAN_ID_UNIQUE,BBL,Original_Address,borough,zip,PLAN_NAME,zola) %>%
+    rename(bbl = BBL
+           ,Corrected_Address = zola
+    )
+) %>%
+  rename(BBL = bbl) %>%
+  filter(!duplicated(paste(PLAN_ID_UNIQUE,BBL,Corrected_Address)))
+```
+
+
+Finally read in the results from our previous method of using the Google API to geocode.
+```{r eval=F}
+old_method_geocoded <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/google_method_geocoded_addresses_v1.rds") %>%
+  mutate(PLAN_ID_UNIQUE = ifelse(grepl("_",plan_id)
+                                 ,plan_id
+                                 ,paste(plan_id,"_0",sep="")
+  )
+  )
+```
+
+
+For the pre-existing manually coded BBLs, remove those PLAN_IDs from the AG data. Keep that slice of the AG data in a separate dataframe that is used downstream
+```{r eval=F}
+AGdata_mancoded.df <- AGdata.df %>%
+  semi_join(
+    mancoded_bbl.df
+    ,by="PLAN_ID_UNIQUE"
+  )
 
 AGdata.df <- AGdata.df %>%
-  filter(
-    PLAN_RESIDENTIAL %in% c("RESIDENTIAL","SPLIT/RESIDENTIAL")
-         )
+  anti_join(
+    mancoded_bbl.df
+    ,by="PLAN_ID_UNIQUE"
+  )
 ```
 
 
@@ -864,6 +920,29 @@ address.key <- address.key %>%
   )
 ```
 
+
+Take cleaned addresses from the manually coded data 
+```{r eval=F}
+address.key <- address.key %>%
+  left_join(
+    mancoded_initial.df %>%
+      select(PLAN_ID_UNIQUE,HOUSE_NUMBER,STREET_NAME)
+    ,by="PLAN_ID_UNIQUE"
+  ) %>%
+  mutate(
+    housenum = ifelse(!is.na(HOUSE_NUMBER)
+                      ,HOUSE_NUMBER
+                      ,housenum
+                      )
+    ,street = ifelse(!is.na(STREET_NAME)
+                     ,STREET_NAME
+                     ,street
+                     )
+  ) %>%
+  select(-HOUSE_NUMBER,-STREET_NAME)
+```
+
+
 ## call to NYC Geoclient 
 
 Function to create URLs with zipcode and borough.
@@ -947,71 +1026,121 @@ cl <- makeCluster(round(detectCores()*.75))
 registerDoParallel(cl)
 ```
 
-Call API for all URLs in the vector 
+
+## Function to Call API
+
+
+Requires httr and dplyr. The two arguments in the function are dataframe and the maximum sleep time in between API calls
 ```{r eval=F}
-ptm <- proc.time()
-initial_output.list <- foreach(i = start:end
-                               , .packages = c("httr")) %dopar% {
-                                 out <- try(GET(url = tmp.vec[i]))
-                                 return(out)
-                               }
-stopCluster(cl)
-api_call.time <- proc.time() - ptm
+nyc_geoclient_call.fun <- function(df,max_sleep.time=.001){
+  require(httr)
+  require(dplyr)
 ```
 
-Extract content from the JSON objects within the list created by calling the API
+### API call
+
+Call API for all urls in the dataframe. The Geoclient API has been returning null values at times. Cause appears to be using it beyond prescribed limits. Putting in a random sleep time in between API calls.
 ```{r eval=F}
-tmp_out.list <- list()
-for(i in 1:length(initial_output.list)){
-  output <- initial_output.list[[i]]
+  start <-1
+  end <- nrow(df)
   
-  if(class(output)=="response"){
-    output <- content(output)
-    if(class(output)=="list"){
-      output <- output$address
+  cl <- makeCluster(round(detectCores()/2))
+  registerDoParallel(cl)
+  
+  ptm <- proc.time()
+  
+  api_output.list <- foreach(i = start:end
+                             , .packages = c("httr")) %dopar% {
+                               out <- try(GET(url = df[i,"url"]))
+                               Sys.sleep(sample(seq(from=0,to=max_sleep.time,by=.00001),1))
+                               return(out)
+                             }
+  stopCluster(cl)
+  api_call.time <- proc.time() - ptm
+```
+
+### Extract data from results
+
+Create empty list. Start loop. At beginning of loop set the object to be worked on as the API return object of that list iteration.
+```{r eval=F}
+  tmp_out.list <- list()
+  
+  for(i in 1:length(api_output.list)){
+    output <-api_output.list[[i]]
+```
+
+Get address content from JSON object. The if statements are included as error handling
+```{r eval=F}
+if(class(output)=="response"){
+      output <- content(output)
+      if(class(output)=="list"){
+        output <- output$address
+        content.names <- names(output)
+      }
     }
+```
+
+
+Pull all pertinent data from the JSON content. Note that a good deal of this isn't currently used. When I initially created the script it seemed like information such as coop number would be nice to include in case we might want it downstream.
+```{r eval=F}
+if(class(output)=="list"){
+      
+      out <- list(
+        bbl = output$bbl
+        ,buildingIdentificationNumber = output$buildingIdentificationNumber
+        ,houseNumber = output$houseNumber
+        ,houseNumberIn = output$houseNumberIn
+        ,firstStreetNameNormalized = output$firstStreetNameNormalized
+        ,boePreferredStreetName = output$boePreferredStreetName
+        ,giStreetName1 = output$giStreetName1
+        ,streetName1In = output$streetName1In
+        ,returnCode1a  = output$returnCode1a
+        ,cooperativeIdNumber = output$cooperativeIdNumber
+        ,latitude = output$latitude
+        ,longitude = output$longitude
+        ,url = df[i,"url"]
+      )
+      
+    }
+```
+
+If the JSON content couldn't be extracted include only the url
+```{r eval=F}
+else {
+      out <- list(url = df[i,"url"])
+    }
+```
+
+Put the list into dataframe format and end the loop. If a call did not return anything every column other than url (which is used as the primary key) in the dataframe shows up as NA in the dataframe.
+```{r eval=F}
+    out <- t(unlist(out)) %>% as.data.frame()
+    tmp_out.list[[i]] <- out
+    cat(i,"\n")
   }
+```
+
+
+Where the output is not a dataframe, set the list item to null (removes item from list). Bind the list of dataframes into a single dataframe. Only keep observations where the return code indicates that a BBL is included. Return results and end function.
+```{r eval=F}
+  tmp_out.list[which(unlist(
+    lapply(tmp_out.list, function(x) class(x))
+  ) != "data.frame")] <- NULL
   
-  if(class(output)=="list"){
-    
-    out <- list(
-      bbl = output$bbl
-      ,buildingIdentificationNumber = output$buildingIdentificationNumber
-      ,houseNumber = output$houseNumber
-      ,houseNumberIn = output$houseNumberIn
-      ,firstStreetNameNormalized = output$firstStreetNameNormalized
-      ,boePreferredStreetName = output$boePreferredStreetName
-      ,giStreetName1 = output$giStreetName1
-      ,streetName1In = output$streetName1In
-      ,returnCode1a  = output$returnCode1a
-      ,cooperativeIdNumber = output$cooperativeIdNumber
-      ,latitude = output$latitude
-      ,longitude = output$longitude
-      ,url = tmp.vec[i]
-    )
-    
-  } else {
-    out <- list(url = tmp.vec[i])
-  }
-  out <- t(unlist(out)) %>% as.data.frame()
-  tmp_out.list[[i]] <- out
-  cat(i,"\n")
+  tmp.out <- bind_rows(tmp_out.list) %>%
+    filter(returnCode1a %in% c("00","01","88"))
+  
+    return(tmp.out)
 }
 ```
 
-Set items which are not dataframes to null and bind list into a single dataframe 
+### First API call
+
+I noticed that sometimes the Geoclient API returned null results. To make sure this doesn't occure the script calls the API a few times and in between attempts to fix problems with the addresses. After each API call a dataframe of observations that were not geocoded is created which is then used in the next call (or in manually fixing or geocoding)
 ```{r eval=F}
-tmp_out.list[which(unlist(
-  lapply(tmp_out.list, function(x) class(x))
-) != "data.frame")] <- NULL
+## first API call 
+tmp.out <- nyc_geoclient_call.fun(address.key)
 
-tmp.out <- bind_rows(tmp_out.list)
-```
-
-# Find missing observations and run through a second time
-
-Find missing observations 
-```{r eval=F}
+## addresses which couldn't be coded by API
 notcoded.df <- bind_rows(
   address.key %>%
     anti_join(
@@ -1026,76 +1155,15 @@ notcoded.df <- bind_rows(
 )
 ```
 
-Run missing observations through the API to make sure we got everything possible
+### Second API calls
+
+In the second API call the maximum sleep time for the random sleep is increased. Because the first API call included over 10k addresses it seems more efficient to allow for some null results the first time around and them sweep them up with a sleep time in the second instance (which has under 1k addresses) than to impose a sleep time between every call for the first one.
+
+What will ultimately be our geocoded dataframe is shaping up in out.df
 ```{r eval=F}
-start <-1
-end <- nrow(notcoded.df)
+tmp.out2 <- nyc_geoclient_call.fun(notcoded.df,max_sleep.time=.2)
 
-cl <- makeCluster(round(detectCores()/2))
-registerDoParallel(cl)
-
-ptm <- proc.time()
-
-second_output.list <- foreach(i = start:end
-                              , .packages = c("httr")) %dopar% {
-                                out <- try(GET(url = notcoded.df[i,"url"]))
-                                return(out)
-                              }
-stopCluster(cl)
-second_api_call.time <- proc.time() - ptm
-
-
-tmp_out2.list <- list()
-
-for(i in 1:length(second_output.list)){
-  output <- second_output.list[[i]]
-  
-  if(class(output)=="response"){
-    output <- content(output)
-    if(class(output)=="list"){
-      output <- output$address
-      content.names <- names(output)
-    }
-  }
-  
-  if(class(output)=="list"){
-    
-    out <- list(
-      bbl = output$bbl
-      ,buildingIdentificationNumber = output$buildingIdentificationNumber
-      ,houseNumber = output$houseNumber
-      ,houseNumberIn = output$houseNumberIn
-      ,firstStreetNameNormalized = output$firstStreetNameNormalized
-      ,boePreferredStreetName = output$boePreferredStreetName
-      ,giStreetName1 = output$giStreetName1
-      ,streetName1In = output$streetName1In
-      ,returnCode1a  = output$returnCode1a
-      ,cooperativeIdNumber = output$cooperativeIdNumber
-      ,latitude = output$latitude
-      ,longitude = output$longitude
-      ,url = tmp.vec[i]
-    )
-    
-  } else {
-    out <- list(url = tmp.vec[i])
-  }
-  out <- t(unlist(out)) %>% as.data.frame()
-  tmp_out2.list[[i]] <- out
-  cat(i,"\n")
-}
-```
-
-
-Bind, add to tmp.out and find all observations which were not coded
-```{r eval=F}
-tmp_out2.list[which(unlist(
-  lapply(tmp_out2.list, function(x) class(x))
-) != "data.frame")] <- NULL
-
-tmp.out2 <- bind_rows(tmp_out2.list) %>%
-  filter(returnCode1a %in% c("00","01","88"))
-
-tmp.out <- bind_rows(
+out.df <- bind_rows(
   tmp.out
   ,tmp.out2
 )
@@ -1103,278 +1171,209 @@ tmp.out <- bind_rows(
 notcoded.df <- bind_rows(
   address.key %>%
     anti_join(
-      tmp.out
+      out.df
       ,by="url"
     )
   ,address.key %>%
     semi_join(
-      tmp.out %>%
+      out.df %>%
         filter(is.na(bbl))
     )
 )
 ```
 
-Select the AG data which was not able to be geolocated by the API and write to disk for the addresses to be manually cleansed
 
-NOTE: Prior experience with this showed that the returns on attempting to geolocate algorithmically diminish steeply. Even with 500 someodd addresses to clean it's faster to do so manually than to write a script that calls a second API. 
+### Third API calls
+
+In the original version of this the NYC Geoclient API wasn't a thing yet. To clean and join the addresses we used the Google Maps API. Those previously cleaned addresses are used here substituting what is in the raw data with the address as normalized by the Google API.  
+
+The Google Maps addresses are not gauranteed to be the same as the city's addresses and I felt that it's an extra layer of complexity that should be avoided where possible. This is why I saved it for a later stage rather than just initially joining with the Google normalized addresses right at the beginning of the script.  
+
+First, join with the initial AG data df and narrow down to only conversion type entries. Join with the Google maps normalized addresses.
 ```{r eval=F}
 notcoded.df <- notcoded.df %>%
   left_join(
-    ag_tmp %>%
-      select(PLAN_NAME,PLAN_ID_UNIQUE)
+    AGdata.df %>%
+      select(PLAN_ID_UNIQUE,UNITS,PLAN_DATE_SUBMITTED,PLAN_DATE_EFFECTIVE,PLAN_CONSTR_TYPE)
+    ,by="PLAN_ID_UNIQUE"
+  ) %>%
+  filter(PLAN_CONSTR_TYPE %in% c("CONVERSION","REHAB")) %>%
+  left_join(
+    old_method_geocoded %>%
+      select(PLAN_ID_UNIQUE,formatted_address,latitude,longitude)
     ,by="PLAN_ID_UNIQUE"
   )
-
-notcoded.df <- notcoded.df %>%
-  select(PLAN_ID_UNIQUE,Original_Address,PLAN_NAME,Corrected_Address,borough,zip)
-
-write.csv(notcoded.df
-          ,"/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/initial_notcoded_condo_coop_conversions.csv"
-          ,row.names=F
-          ,na=""
-)
 ```
 
-
-# Run through the names which were fixed manually
-
-Read in the addresses which were cleaned manually. Create a vector of URLs and add into the new address key.
-
+Substitute the Google addresses for the original address where possible. gsub and word are used to remove characters and words before/after the first instances of spaces and commas to get house numbers and street names out of the google addresses.
 ```{r eval=F}
-manual_coded.df <- read.csv("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/condo_coop_conversions manual_code 20180419_1604.csv"
-                            ,stringsAsFactors=F
-)
+notcoded.df <- notcoded.df %>%
+  mutate(
+    ## google addresses include city, state and zip. Remove those by taking out everything after the first comma
+    google_address = gsub(",.*","",formatted_address)
+    ## remove everything after the first space to get house number
+    ,google_housenum = gsub(" .*","",google_address)
+    ## remove everything after the first space to get street name
+    ,google_street = word(google_address,start=2,end=-1)
+    ## substitute the google housenumber and street names where they are available
+    ,housenum = ifelse(!is.na(google_housenum)
+                       ,google_housenum
+                       ,housenum
+                       )
+    ,street = ifelse(!is.na(google_street)
+                     ,google_street
+                     ,street
+                     )
+  )
+```
 
-
-tmp2.vec <- unlist(
-  lapply(1:nrow(manual_coded.df), function(x){
+Use the URL creation function to create URLs out of the google addresses
+```{r eval=F}
+tmp.vec <- unlist(
+  lapply(1:nrow(notcoded.df), function(x){
     url <- url_create.fun(
-      housenum = manual_coded.df[x,"HOUSE_NUMBER"]
-      ,street =  manual_coded.df[x,"STREET_NAME"]
-      ,borough =  manual_coded.df[x,"borough"]
-      ,zip =  manual_coded.df[x,"zip"]
+      housenum = notcoded.df[x,"housenum"]
+      ,street =  notcoded.df[x,"street"]
+      ,borough =  notcoded.df[x,"borough"]
+      ,zip =  notcoded.df[x,"zip"]
     )
     return(url)}
   )
 )
 
-manual_coded.df[,"url"] <- tmp2.vec
+notcoded.df[,"url"] <- tmp.vec
 ```
 
-Initialize cluster
+Call the API a third time, append results to the out.df dataframe and create the notcoded dataframe as we did previously.
 ```{r eval=F}
-start <-1
-end <- nrow(manual_coded.df)
+tmp.out3 <- nyc_geoclient_call.fun(notcoded.df,max_sleep.time=.25)
 
-cl <- makeCluster(round(detectCores()/2))
-registerDoParallel(cl)
-```
+out.df <- bind_rows(
+  out.df
+  ,tmp.out3
+)
 
-
-Call API 
-```{r eval=F}
-ptm <- proc.time()
-second_output.list <- foreach(i = start:end
-                              , .packages = c("httr")) %dopar% {
-                                out <- try(GET(url = manual_coded.df[i,"url"]))
-                                return(out)
-                              }
-stopCluster(cl)
-second_api_call.time <- proc.time() - ptm
-```
-
-Get contents from items returned
-```{r eval=F}
-tmp_out2.list <- list()
-
-for(i in 1:length(second_output.list)){
-  output <- second_output.list[[i]]
-  
-  if(class(output)=="response"){
-    output <- content(output)
-    if(class(output)=="list"){
-      output <- output$address
-      content.names <- names(output)
-    }
-  }
-  
-  if(class(output)=="list"){
-    
-    out <- list(
-      bbl = output$bbl
-      ,buildingIdentificationNumber = output$buildingIdentificationNumber
-      ,houseNumber = output$houseNumber
-      ,houseNumberIn = output$houseNumberIn
-      ,firstStreetNameNormalized = output$firstStreetNameNormalized
-      ,boePreferredStreetName = output$boePreferredStreetName
-      ,giStreetName1 = output$giStreetName1
-      ,streetName1In = output$streetName1In
-      ,returnCode1a  = output$returnCode1a
-      ,cooperativeIdNumber = output$cooperativeIdNumber
-      ,latitude = output$latitude
-      ,longitude = output$longitude
-      ,url = manual_coded.df[i,"url"]
+notcoded.df <- bind_rows(
+  address.key %>%
+    anti_join(
+      out.df
+      ,by="url"
     )
-    
-  } else {
-    out <- list(url = tmp.vec[i])
-  }
-  out <- t(unlist(out)) %>% as.data.frame()
-  tmp_out2.list[[i]] <- out
-  
-  cat(i,"\n")
-}
+  ,address.key %>%
+    semi_join(
+      out.df %>%
+        filter(is.na(bbl))
+    )
+)
 ```
 
 
-Bind and create dataframe of the portions of the address key which cannot be geocoded even using the cleaned addresses
+
+At this point there should only be a handful of addresses that couldn't be geocoded and matched with BBL via the NYC Geoclient API. Write a csv containing those addresses to disk and manually find the BBLs using Zola:   https://zola.planning.nyc.gov/about#9.72/40.7125/-73.733  
+
+Read the manually coded BBLs back in
 ```{r eval=F}
-tmp_out2.list[which(unlist(
-  lapply(tmp_out2.list, function(x) class(x))
-) != "data.frame")] <- NULL
-
-tmp.out2 <- bind_rows(tmp_out2.list)
-
-notcoded_secondary.df <- address.key %>%
-  semi_join(tmp.out2 %>%
-              filter(is.na(bbl)) %>%
-              left_join(manual_coded.df %>%
-                          select(url,PLAN_ID_UNIQUE)
-                        ,by="url"
-              )
-            ,by="PLAN_ID_UNIQUE"
-  ) %>%
-  mutate(bbl = NA) %>%
-  select(PLAN_ID_UNIQUE,bbl,Original_Address,PLAN_NAME,Corrected_Address,borough,zip)
-```
-
-
-Write to disk to find the BBLs manually. 
-```{r eval=F}
-write.csv(notcoded_secondary.df
-          ,"/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/initial_secondary_notcoded_condo_coop_conversions.csv"
+write.csv(notcoded.df
+          ,paste(
+            "/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/initial_notcoded_condo_coop "
+            ,format(
+              Sys.time()
+              ,"%Y%m%d_%H%M"
+            )
+            ,".csv"
+            ,sep=""
+          )
           ,row.names=F
           ,na=""
 )
+
+## Read back in 
+mancoded_bbl_secondary <- read.csv(
+  "/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/mancoded_condo_coop_20180622.csv"
+  ,stringsAsFactors=F
+)
 ```
 
-I've found the best primary means of finding BBLs for addresses is using NYC's zoning and land use (ZoLa) interface. However, for some observations no address is given or incorrect addresses are given. By using a combination of plan names, the DOB's Building Information Systems website and Google I was able to recover a good amount of these. However, there a handful of addresses for which there is simply not enough information. 
+## Final join and munge
 
-ZoLa URL:
-https://zola.planning.nyc.gov/about#9.72/40.7125/-73.733
-
-## Read in Final Manual step and create output
-
+Join the geocoded dataframe with address key. Give columns the proper names and create HWE BBL format out of the NYC BBL format. Combine with the manually coded BBLs
 ```{r eval=F}
-mancoded_secondary.df <- read.csv("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/secondary_notcoded_condo_coop_conversions manual_code 20180420_1134.csv"
-                                  ,stringsAsFactors=F)
-```
-
-
-Pull address key for observations which were programmatically coded
-```{r eval=F}
-tmp.out <- tmp.out %>%
-  left_join(
-    address.key %>%
-      select(PLAN_ID_UNIQUE,url)
+geocoded.df <- address.key %>%
+  inner_join(
+    out.df %>%
+      select(url,bbl,latitude,longitude,buildingIdentificationNumber) %>%
+      rename(lat = latitude
+             ,lon =longitude
+             ,BIN = buildingIdentificationNumber)
     ,by="url"
   ) %>%
-  filter(!is.na(bbl))
-```
-
-The formatting issue for the majority of AG Addresses which could not be coded was that multiple addresses were in a single line. In a few circumstances these are multiple BBLs being converted at the same time but more often than not they are multiple street addresses for the same BBL. It was my assessment that in blowing out the addresses the more common occurance was that more errant BBLs were included and unfortunately there is no way to know for certain. Moreover, becuase the number of units stated in the AG documents are for all addresses included we only want to include one instance from each plan Id. To deal with this I group on plan Id and select the BBL which appears the greatest number of times.
-
-```{r eval=F}
-tmp.out2 <- tmp.out2 %>%
-  left_join(
-    manual_coded.df %>%
-      select(PLAN_ID_UNIQUE,url)
-    ,by="url"
-  ) %>%
-  filter(!is.na(bbl))
-
-tmp.out2 <- tmp.out2 %>%
-  group_by(PLAN_ID_UNIQUE) %>%
-  group_by(bbl) %>%
-  mutate(appearances = n()) %>%
-  filter(appearances == max(appearances)) %>%
-  ungroup() %>%
-  filter(!duplicated(bbl))
-```
-
-Bind the programmatically geocoded data with the manally coded data and create HWE standardized format BBL.
-```{r eval=F}
-tmp.out <- bind_rows(tmp.out
-                     ,tmp.out2)
-
-tmp.out <- tmp.out %>%
-  filter(!is.na(bbl) & !duplicated(bbl)) %>%
-  mutate(BBL = 
-           paste(as.numeric(str_sub(
-             bbl,start=1,end=1
-           ))
-           ,as.numeric(str_sub(
-             bbl,start=2,end=-5
-           ))
-           ,as.numeric(str_sub(
-             bbl,start=-4,end=-1
-           ))
-           ,sep="_"
-           )
+  mutate(BBL = paste(
+    str_sub(bbl,start=1,end=1) %>% as.numeric()
+    ,str_sub(bbl,start=2,end=-5) %>% as.numeric()
+    ,str_sub(bbl,start=-4,end=-1) %>% as.numeric()
+    ,sep="_"
   )
+  )
+
+geocoded.df <- bind_rows(
+  geocoded.df
+  ,mancoded_bbl.df
+)
 ```
 
 
-Add in the final manually coded addresses
-```{r eval=F}
-tmp.out <- tmp.out %>%
-  left_join(mancoded_secondary.df %>%
-              select(PLAN_ID_UNIQUE,BBL) %>%
-              rename(tmp = BBL)
-            ,by="PLAN_ID_UNIQUE"
-            ) %>%
-  mutate(BBL = ifelse(!is.na(tmp)
-                      ,tmp
-                      ,BBL
-                      )
-         )
+Bind the AGdata dataframe and the section of the AGdata dataframe which contains the original manually coded BBLs (from the begining). Join the geocoded dataframe with the AGdata to effectively get the AGdata dataframe with BBLs attached.  
 
-tmp.out <- bind_rows(
-  tmp.out
-  ,mancoded_secondary.df %>%
-    anti_join(tmp.out
-              ,by="PLAN_ID_UNIQUE")
+The reason for joining geocoded with AGdata with geocoded on the left hand side is that in the data given to us by the NY Attorney General there are instances of multiple BBLs being included in a single conversion plan. Our geocoding process thus creates duplicated Plan IDs with non-duplicated BBLs. We want to keep all of the BBLs. After the join de-duping is done by looking for duplicates of BBL, Plan ID and plan construction type.
+```{r eval=F}
+AGdata.df <- bind_rows(
+  AGdata.df
+  ,AGdata_mancoded.df
 )
 
-AGdata.df <- tmp.out %>%
-  select(BBL,PLAN_ID_UNIQUE,latitude,longitude,buildingIdentificationNumber) %>%
-  rename(BIN = buildingIdentificationNumber) %>%
-  left_join(AGdata.df
-            ,by="PLAN_ID_UNIQUE")
+geocoded.df <- geocoded.df %>%
+  select(PLAN_ID_UNIQUE,BBL,lat,lon) %>%
+  full_join(
+    AGdata.df
+    ,by="PLAN_ID_UNIQUE"
+  ) %>%
+  filter(!duplicated(paste(BBL,PLAN_ID_UNIQUE,PLAN_CONSTR_TYPE)))
 ```
 
-Creating a variable for the year in which the conversion was done.  
+Filtering out duplicated BBLs is more complex. What we care about is the first instance of a conversion. It's possible that a building could be converted to coop and then later to condo. It's also possible a building is torn down or that the data is simply erroneous. So the earliest data isn't acceptable.  
 
-A number of plans do not include the date the plan was effected. I initially suspected that these plans may have never been enacted but after carefully looking through the data I found that this is not necessarily indicative of whether a plan was enacted or not. Of the plans I inspected some were abandoned but not in sizable numbers and even those with an effective date may have been abandoned.  
-
-I further found that for observations with a PLAN_DATE_EFFECTIVE value the average time in between when a plan was reviewed and when a plan was enacted was approximately 340 days. Though there was a good deal of variance it appeared stochastic. So to deal with missing PLAN_DATE_EFFECTIVE values I simply add 1 to the year in which the plan was reviewed.
-
+First, if an observation is classified is new or the effective date is missing, remove those observations. This is done by splitting the dataframe in two, one of which contains all of the instances which are listed as new or do not have an effective date. Remove all BBLs in the new_or_noneffective dataframe which have a corresponding BBL in the effective conversions dataframe. Bind the two back together, arrange so that the earliest conversions come first and then remove all duplicated BBLs.
 ```{r eval=F}
-AGdata.df <- AGdata.df %>%
+geocoded_new_or_noneffective <- geocoded.df %>%
+  filter(is.na(PLAN_DATE_EFFECTIVE) | PLAN_CONSTR_TYPE %in% "NEW")
+
+geocoded.df <- geocoded.df %>%
+  filter(!(is.na(PLAN_DATE_EFFECTIVE) | PLAN_CONSTR_TYPE %in% "NEW")) %>%
+  group_by(BBL) %>%
+  filter(PLAN_DATE_EFFECTIVE == min(PLAN_DATE_EFFECTIVE))
+
+geocoded.df <- bind_rows(
+  geocoded.df
+  ,geocoded_new_or_noneffective %>%
+    anti_join(geocoded.df
+              ,by="BBL") %>%
+    arrange(PLAN_DATE_REVIEWED)
+  ) %>%
+  filter(!duplicated(BBL))
+```
+
+Create a variable for year BBL was converted. Then put the dataframe into the format which is used by later scripts.
+```{r eval=F}
+geocoded.df <- geocoded.df %>%
   mutate(EFFECTIVE_YEAR = ifelse(!is.na(PLAN_DATE_EFFECTIVE)
                                  ,year(PLAN_DATE_EFFECTIVE)
                                  ,year(PLAN_DATE_REVIEWED) + 1
   )
   )
-```
 
-Creating final output and saving to disk.  
-
-Where conversion type is COOPERATIVE/CONDOMINIUM my best guess is that these are coops within a condo building. I set these to COOPERATIVE because their condo status is only a technicality. 
-
-```{r eval=F}
-out.df <- AGdata.df %>%
-  select(BBL,EFFECTIVE_YEAR,PLAN_TYPE,UNITS) %>%
+## put into format easily combined with pluto augmented
+geocoded.df <- geocoded.df %>%
+  select(BBL,EFFECTIVE_YEAR,PLAN_TYPE,UNITS,PLAN_ID_UNIQUE,PLAN_CONSTR_TYPE) %>%
   rename(ConversionYear = EFFECTIVE_YEAR
          ,ConversionType = PLAN_TYPE
          ,UnitsRes.AG = UNITS) %>%
@@ -1384,8 +1383,22 @@ out.df <- AGdata.df %>%
     ,ConversionType
   )
   )
+```
 
-saveRDS(out.df,"/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/condo_coop_conversions_df 20180427_1306.rds")
+
+Write to disk with datetime-stamp.
+```{r eval=F}
+saveRDS(geocoded.df
+        ,paste(
+          "/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/condo_coop_conversions_df "
+          ,format(
+            Sys.time()
+            ,"%Y%m%d_%H%M"
+          )
+          ,".rds"
+          ,sep=""
+        )
+)
 ```
 
 
