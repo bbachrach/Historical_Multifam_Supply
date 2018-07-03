@@ -1056,8 +1056,6 @@ nyc_geoclient_call.fun <- function(df,max_sleep.time=.001){
   require(dplyr)
 ```
 
-### API call
-
 Call API for all urls in the dataframe. The Geoclient API has been returning null values at times. Cause appears to be using it beyond prescribed limits. Putting in a random sleep time in between API calls.
 
 ``` r
@@ -1079,9 +1077,7 @@ Call API for all urls in the dataframe. The Geoclient API has been returning nul
   api_call.time <- proc.time() - ptm
 ```
 
-### Extract data from results
-
-Create empty list. Start loop. At beginning of loop set the object to be worked on as the API return object of that list iteration.
+Extract data from results. Create empty list. Start loop. At beginning of loop set the object to be worked on as the API return object of that list iteration.
 
 ``` r
   tmp_out.list <- list()
@@ -1445,10 +1441,13 @@ Read in the condo/coop classifier dataframe from the first script and pluto. Put
 condocoop.df <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/condocoop_df 20180430_1615.rds") %>%
   filter(!duplicated(BBL) & !grepl("[[:alpha:]]",BBL))
 
-pluto.all <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Project Data/PLUTO/pluto_lean_compressed_2003_2017.rds")
+pluto.all <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Project Data/PLUTO/pluto_lean_compressed_all_years.rds")
 
+## get most recent version of pluto and put BBL, APPBBL, APPDate into proper format
+
+## start by getting most recent data
 pluto <- pluto.all %>%
-  filter(Year==2017 & !duplicated(BBL)) %>%
+  filter(Year==2018) %>%
   mutate(BBL = as.character(
     paste(as.numeric(BoroCode)
           ,as.numeric(Block)
@@ -1474,43 +1473,70 @@ pluto <- pluto.all %>%
   )
 ```
 
-A number of rows in pluto have improperly formatted values in the YearBuilt field or a value of 0. To try and fill some of these out I take a slice of all pluto versions 2014 forward, remove observations with an improperly formatted YearBuilt field, then duplicated BBLs and attempt to join 2017 pluto with it.
+Recovering missing Year Built values where possible. A number of rows in pluto have improperly formatted values in the YearBuilt field or a value of 0. To try and fill some of these out I take a slice of all pluto versions 2014 forward, remove observations with an improperly formatted YearBuilt field, then duplicated BBLs and attempt to join 2017 pluto with it.
+
+For error handling, ensure that there are indeed improperly formatted or missing values
+
+``` r
+incorrect_yb <- pluto %>%
+  summarize(incorrect_yb.count = sum(YearBuilt==0 | nchar(as.character(YearBuilt))!=4)) %>%
+  pull(incorrect_yb.count)
+
+if(incorrect_yb > 0){
+```
+
+Filter the pluto all dataframe to only 2014 and forward with properly formatted years. Create HWE standardized BBL format.
 
 ``` r
 pluto.tmp <- pluto.all %>%
-  filter(Year >= 2014 & YearBuilt!=0 & nchar(YearBuilt)==4) %>%
-  arrange(desc(Year)) %>%
-  filter(!duplicated(BBL)) %>%
-  mutate(BBL = as.character(
-    paste(as.numeric(BoroCode)
-          ,as.numeric(Block)
-          ,as.numeric(Lot)
-          ,sep="_"
+    filter(Year >= 2014 & YearBuilt!=0 & nchar(as.character(YearBuilt))==4) %>%
+    arrange(desc(Year)) %>%
+    filter(!duplicated(BBL)) %>%
+    mutate(BBL = as.character(
+      paste(as.numeric(BoroCode)
+            ,as.numeric(Block)
+            ,as.numeric(Lot)
+            ,sep="_"
+      )
     )
-  )
-  )
+    )
+```
 
-pluto.tmp <- pluto.tmp %>%
-  semi_join(
-    pluto %>%
-      filter(YearBuilt==0 | nchar(YearBuilt)<4) 
-    ,by=c("BBL","BldgClass","UnitsRes")
-  ) %>%
-  arrange(BoroCode,desc(UnitsRes)) %>%
-  select(BBL,BldgClass,UnitsRes,YearBuilt,everything())
+Restrict the temporary dataframe to only observations which have an improperly formatted year for the current version of pluto
 
-pluto <- pluto %>%
-  left_join(
-    pluto.tmp %>%
-      select(BBL,BldgClass,UnitsRes,YearBuilt) %>%
-      rename(tmp = YearBuilt)
-    ,by=c("BBL","BldgClass","UnitsRes")
-  ) %>%
-  mutate(YearBuilt = ifelse(!is.na(tmp)
-                            ,tmp
-                            ,YearBuilt
-                            )
-         )
+``` r
+  pluto.tmp <- pluto.tmp %>%
+    semi_join(
+      pluto %>%
+        filter(YearBuilt==0 | nchar(as.character(YearBuilt))<4) 
+      ,by=c("BBL"
+            # ,"BldgClass"
+            ,"UnitsRes"
+            )
+    ) %>%
+    arrange(BoroCode,desc(UnitsRes)) %>%
+    select(BBL,BldgClass,UnitsRes,YearBuilt,everything())
+```
+
+Join on both BBL and number of residential units to ensure that it's actually. This ensures it's the same building. Substitute the properly formatted YearBuilt from the prior years by first assigning it the name tmp in the join and then using an ifelse statement to use tmp for YearBuilt where YearBuilt is improperly formatted
+
+``` r
+ pluto <- pluto %>%
+    # select(-tmp) %>%
+    left_join(
+      pluto.tmp %>%
+        select(BBL,UnitsRes,YearBuilt) %>%
+        rename(tmp = YearBuilt)
+      ## note joining by multiple columns to ensure the building didn't change
+      ,by=c("BBL","UnitsRes")
+    ) %>%
+    mutate(YearBuilt = ifelse(!is.na(tmp)
+                              ,tmp
+                              ,YearBuilt
+    )
+    ) %>%
+    select(-tmp)
+}
 ```
 
 Do the same in an attempt to recover more latitude and longitude coordinates. For this one it's assumed that BBLs are not re-used and thus remain geographically stationary. Operating on this assumption it is not necessary to restrict the auxiliary pluto dataset to recent versions.
@@ -1620,6 +1646,8 @@ Add TCO data to pluto
 
 For most observations to get delivery date we just add 2 to the YearBuit date. However, for buildings delivered 2012 or later it's possible to get the actual TCO date
 
+It should be noted that BBLs change during the TCO process. So the script attempts to join using BBL, APPBBL (former BBL) as well as direct address matching.
+
 Get TCO data from API
 
 ``` r
@@ -1660,7 +1688,7 @@ tco.df.hold <- read_csv(tco_nyc_httr.dl$content
   select(-BIN)
 ```
 
-Buildings typically have multiple TCOs. Some TCOs are issued to buildings that are not new build. Restricting the TCO data to just new build projects and setting TCO date to the first TCO date the building has within the dataset.
+Buildings typically have multiple TCOs. Some TCOs are issued to buildings that are not new build. Here I'm restricting the TCO data to just new build projects and setting TCO date to the first TCO date the building has within the dataset.
 
 ``` r
 tco.df <- tco.df.hold %>%
@@ -1803,7 +1831,7 @@ In the next script we take out units by YearBuilt and add back in the number of 
 Read in output from the AG Data Address Cleaning script and join with pluto
 
 ``` r
-AGdata.df <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/condo_coop_conversions_df 20180427_1306.rds")
+AGdata.df <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/condo_coop_conversions_df 20180622_1518.rds")
 ```
 
 Join AG data with Pluto. Where conversion year is missing, use APPDate if the APPBBL is not a condo and the TCO is less than or equal to the APPDate.
@@ -1815,15 +1843,20 @@ pluto.aug.hold <- pluto.aug
 pluto.aug <- pluto.aug.hold %>%
   left_join(AGdata.df
             ,by="BBL") %>%
+  ## Using the year of APPDate in some circumstances where Conversion Year is not available
   mutate(ConversionYear = ifelse(
+    ## if the observation is a condo or conversion year is missing
     Type %in% "condo" & is.na(ConversionYear)
+    ## check that it was not previously a condo
     ,ifelse(
+      ## Lot in APPBBL is not four digits
       nchar(
         (str_sub(
           gsub(".*_","",APPBBL)
           ,start=1
           ,end=-1
         ))!=4 & 
+          ## Lot in APPBBL does not start with 75
           str_sub(
             gsub(".*_","",APPBBL)
             ,start=1
@@ -1831,17 +1864,20 @@ pluto.aug <- pluto.aug.hold %>%
           ) != 75 &
           TCO <= year(APPDate)
         )
+      ## if conditions are true use year of APPDate, otherwise use conversionyear
       ,year(APPDate)
       ,ConversionYear
     )
     ,ConversionYear
   )
+## if conversion year is not missing and conversion year is within two years of TCO use TCO as conversion year
   ,ConversionYear = ifelse(!is.na(ConversionYear) & abs(ConversionYear - TCO)<=2
                            ,TCO
                            ,ConversionYear
                            )
   ) %>%  
   mutate(
+    ## If converted within 4 years of TCO we're just saying it was built as a condo
     DECLARE_NEWBUILD = ConversionYear - TCO < 5
   )
 ```
@@ -1906,10 +1942,10 @@ This is the core concept of our historical multifamily supply analysis. Within a
 Read in the previously created pluto augmented dataframe
 
 ``` r
-pluto.aug <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/pluto_augmented 20180501_1332.rds")
+pluto.aug <- readRDS("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/pluto_augmented 20180622_1527.rds")
 ```
 
-Read in the proportion of condos being rented out. File is in format of one observation per HVS year. After reading in file blow out so that there is a value for every year 1980-2017. Years on which there was not an HVS wave recieve the value from the previous HVS wave
+Read in the proportion of condos being rented out. This was derived from NYC HVS raw data. File is in format of one observation per HVS year. After reading in file blow out so that there is a value for every year 1980-2017. Years on which there was not an HVS wave recieve the value from the previous HVS wave
 
 ``` r
 condo_rental.df <- read.csv("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Data Sources/HVS/condo rental metric small.csv"
@@ -1996,16 +2032,16 @@ Filter out the dataframe to only buildings which were condo or coop in a given y
 -   Take sum of the residential units
 
 ``` r
-condo <- tmp.df.outer %>%
-  filter(Type %in% "condo" & TCO <= year.levs[x] & (DECLARE_NEWBUILD==T | ConversionYear <= year.levs[x] | is.na(ConversionYear))) %>%
-  summarize(units = sum(UnitsRes,na.rm=T)) %>%
-  pull(units)
-
-coop <- tmp.df.outer %>%
-  filter(Type %in% "coop" & TCO <= year.levs[x] & (DECLARE_NEWBUILD==T | ConversionYear <= year.levs[x] | is.na(ConversionYear))) %>%
-  summarize(units = sum(UnitsRes,na.rm=T)) %>%
-  pull(units)
-
+    condo <- tmp.df.outer %>%
+      filter(Type %in% "condo" & TCO <= year.levs[x] & (DECLARE_NEWBUILD==T | ConversionYear <= year.levs[x] | is.na(ConversionYear))) %>%
+      summarize(units = sum(UnitsRes,na.rm=T)) %>%
+      pull(units)
+    
+    coop <- tmp.df.outer %>%
+      filter(Type %in% "coop" & TCO <= year.levs[x] & (DECLARE_NEWBUILD==T | ConversionYear <= year.levs[x] | is.na(ConversionYear))) %>%
+      summarize(units = sum(UnitsRes,na.rm=T)) %>%
+      pull(units)
+    
     owned <- condo + coop
 ```
 
@@ -2019,23 +2055,23 @@ Rentals are slightly more difficult
 -   Take sum of residential units
 
 ``` r
-rentals <- tmp.df.outer %>%
-  filter(TCO <= year.levs[x] & 
-           (Type %in% "rental" |
-              (Type %in% c("condo","coop") & !is.na(ConversionYear) & ConversionYear > year.levs[x] & DECLARE_NEWBUILD==F))
-  ) %>%
-  summarize(units = sum(UnitsRes,na.rm=T)) %>%
-  pull(units)
+  rentals <- tmp.df.outer %>%
+      filter(TCO <= year.levs[x] & 
+               (Type %in% "rental" |
+                  (Type %in% c("condo","coop") & !is.na(ConversionYear) & ConversionYear > year.levs[x] & DECLARE_NEWBUILD==F))
+      ) %>%
+      summarize(units = sum(UnitsRes,na.rm=T)) %>%
+      pull(units)
 ```
 
 For small type buildings simply filter on the TCO being before or during the year of interest, filter on Type and take the sum of residential units
 
 ``` r
-small <- tmp.df.outer %>%
-  filter(TCO <= year.levs[x] &
-           Type %in% "small") %>%
-  summarize(units = sum(UnitsRes,na.rm=T)) %>%
-  pull(units)
+ small <- tmp.df.outer %>%
+      filter(TCO <= year.levs[x] &
+               Type %in% "small") %>%
+      summarize(units = sum(UnitsRes,na.rm=T)) %>%
+      pull(units)
 ```
 
 End inner loop by returning a vector with (1) year (2) area (3) number of rentals (4) number of coops+condos (5) condos (6) coops (7) small type
@@ -2055,7 +2091,7 @@ out.df <- as.data.frame(do.call("rbind",tmp.out)
 
 colnames(out.df) <- c("Year","Neighborhood","Rentals","Owned","Condo","Coop","Small")
 
-out.df <- out.df %>% 
+  out.df <- out.df %>% 
     mutate(
       Rentals = ifelse(as.numeric(Rentals)<0
                        ,0
@@ -2322,7 +2358,8 @@ out.df <- bind_rows(out.df.nyc,out.df.boro,out.df.nbrhd) %>%
   )
 
 
-setwd("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data")
+setwd("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/output")
+
 write.csv(out.df,
           paste("multifam_supply"
                 ,format(
@@ -2332,6 +2369,38 @@ write.csv(out.df,
                 ,".csv"
                 ,sep="")
           ,row.names=F
+)
+
+saveRDS(out.df,paste("multifam_supply"
+                     ,format(
+                       Sys.time()
+                       ,"%Y%m%d_%H%M%S"
+                     )
+                     ,".rds"
+                     ,sep="")
+)
+
+setwd("/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data")
+saveRDS(pluto.aug
+        ,paste("pluto_augmented"
+               ,format(
+                 Sys.time()
+                 ,"%Y%m%d_%H%M"
+               )
+               ,".rds"
+               ,sep="")
+)
+
+save.image(
+  paste(
+    "/Users/billbachrach/Dropbox (hodgeswardelliott)/Data Science/Bill Bachrach/Major projects/Multifamily Supply/Refresh/data/backintime_workspace "
+    ,format(
+      Sys.time()
+      ,"%Y%m%d_%H%M"
+    )
+    ,".RData"
+    ,sep=""
+  )
 )
 ```
 

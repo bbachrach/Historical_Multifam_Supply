@@ -82,7 +82,7 @@ if(incorrect_yb > 0){
     )
     )
   
-  ## restrict to only BBLs which have an improperly formatted year in Pluto v2017
+  ## restrict to only BBLs which have an improperly formatted year in Pluto v2018
   pluto.tmp <- pluto.tmp %>%
     semi_join(
       pluto %>%
